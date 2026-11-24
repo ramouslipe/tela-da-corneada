@@ -21,6 +21,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   SlidersHorizontal,
+  RefreshCw,
 } from 'lucide-react';
 import type { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase, Room, ROOM_THEMES } from '@/lib/supabase';
@@ -49,6 +50,7 @@ interface FloatingReaction {
 }
 
 type QualityPreset = '1080p60' | '1080p30' | '720p60';
+type ConnectionStatus = 'idle' | 'negotiating' | 'connecting' | 'connected' | 'failed';
 
 const QUALITY_CONFIG: Record<
   QualityPreset,
@@ -59,13 +61,27 @@ const QUALITY_CONFIG: Record<
   '720p60': { label: '720p 60fps Leve', width: 1280, height: 720, fps: 60, bitrate: 3_200_000 },
 };
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
+function getIceConfig(): RTCConfiguration {
+  const iceServers: RTCIceServer[] = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-  ],
-};
+  ];
+
+  const turnUrls = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
+  const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
+
+  if (turnUrls && turnUsername && turnCredential) {
+    iceServers.push({
+      urls: turnUrls.split(',').map((u) => u.trim()),
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return { iceServers };
+}
 
 const USER_COLORS = [
   '#0ea5e9',
@@ -108,6 +124,7 @@ function RoomContent() {
   const [isSharing, setIsSharing] = useState(false);
   const [activeSharer, setActiveSharer] = useState<Participant | null>(null);
   const [hasVideoStream, setHasVideoStream] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(0.9);
   const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
@@ -121,6 +138,7 @@ function RoomContent() {
   // Refs críticas de WebRTC e Realtime
   const channelRef = useRef<RealtimeChannel | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const qualityRef = useRef<QualityPreset>('1080p60');
   const peerConnectionsRef = useRef(new Map<string, RTCPeerConnection>());
   const pendingCandidatesRef = useRef(new Map<string, RTCIceCandidateInit[]>());
   const requestedSharerRef = useRef<string | null>(null);
@@ -129,12 +147,15 @@ function RoomContent() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    qualityRef.current = quality;
+  }, [quality]);
+
+  useEffect(() => {
     peerIdRef.current = crypto.randomUUID();
 
     const savedNick = localStorage.getItem('corneada_username');
     if (savedNick) setUsername(savedNick);
 
-    // Dentro da sala, modo escuro por padrão fica melhor para assistir telas (mas pode trocar)
     const savedTheme = localStorage.getItem('corneada_ui_theme') || 'dark';
     const isDark = savedTheme === 'dark';
     setDarkMode(isDark);
@@ -184,23 +205,30 @@ function RoomContent() {
   }
 
   function attachStreamToVideo(stream: MediaStream | null, muteLocal: boolean) {
-    if (!videoRef.current) return;
-    videoRef.current.srcObject = stream;
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Evita reiniciar o player quando vídeo e áudio chegam em eventos separados
+    if (stream && video.srcObject === stream) {
+      setHasVideoStream(true);
+      return;
+    }
+
+    video.srcObject = stream;
     setHasVideoStream(Boolean(stream));
 
     if (stream) {
-      videoRef.current.muted = muteLocal ? true : muted;
-      videoRef.current
+      video.muted = muteLocal ? true : muted;
+      video
         .play()
         .then(() => setNeedsAudioUnlock(false))
         .catch(() => {
-          // Fallback caso o navegador exija clique para liberar áudio
-          if (videoRef.current) {
-            videoRef.current.muted = true;
-            videoRef.current.play().catch(() => {});
-            setNeedsAudioUnlock(true);
-          }
+          video.muted = true;
+          video.play().catch(() => {});
+          if (!muteLocal) setNeedsAudioUnlock(true);
         });
+    } else {
+      setNeedsAudioUnlock(false);
     }
   }
 
@@ -209,6 +237,7 @@ function RoomContent() {
     if (pc) {
       pc.onicecandidate = null;
       pc.ontrack = null;
+      pc.onconnectionstatechange = null;
       pc.close();
       peerConnectionsRef.current.delete(remoteId);
     }
@@ -216,7 +245,12 @@ function RoomContent() {
   }
 
   function closeAllPeerConnections() {
-    peerConnectionsRef.current.forEach((pc) => pc.close());
+    peerConnectionsRef.current.forEach((pc) => {
+      pc.onicecandidate = null;
+      pc.ontrack = null;
+      pc.onconnectionstatechange = null;
+      pc.close();
+    });
     peerConnectionsRef.current.clear();
     pendingCandidatesRef.current.clear();
   }
@@ -235,44 +269,57 @@ function RoomContent() {
   }
 
   // Transmissor cria conexão WebRTC dedicada para um espectador
-  async function createOfferForViewer(viewerId: string) {
+  async function createOfferForViewer(viewerId: string, force = false) {
     const stream = localStreamRef.current;
     const channel = channelRef.current;
     if (!stream || !channel) return;
 
+    // Evita recriar conexão se já houver uma negociação ativa com esse espectador
+    const existing = peerConnectionsRef.current.get(viewerId);
+    if (
+      !force &&
+      existing &&
+      (existing.connectionState === 'new' ||
+        existing.connectionState === 'connecting' ||
+        existing.connectionState === 'connected')
+    ) {
+      return;
+    }
+
     closePeerConnection(viewerId);
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const pc = new RTCPeerConnection(getIceConfig());
     peerConnectionsRef.current.set(viewerId, pc);
 
-    const preset = QUALITY_CONFIG[quality];
+    const preset = QUALITY_CONFIG[qualityRef.current];
+    let videoSender: RTCRtpSender | null = null;
 
     stream.getTracks().forEach((track) => {
       if (track.kind === 'video') {
         try {
-          track.contentHint = quality === '1080p30' ? 'detail' : 'motion';
+          track.contentHint = qualityRef.current === '1080p30' ? 'detail' : 'motion';
         } catch {
           // Alguns navegadores não suportam contentHint
         }
       }
       const sender = pc.addTrack(track, stream);
-
-      // Eleva o teto de bitrate para tela nítida em 1080p 60fps
-      if (track.kind === 'video') {
-        setTimeout(async () => {
-          try {
-            const params = sender.getParameters();
-            if (!params.encodings || params.encodings.length === 0) {
-              params.encodings = [{}];
-            }
-            params.encodings[0].maxBitrate = preset.bitrate;
-            params.encodings[0].maxFramerate = preset.fps;
-            await sender.setParameters(params);
-          } catch {
-            // Ignora caso o navegador gerencie automaticamente
-          }
-        }, 300);
-      }
+      if (track.kind === 'video') videoSender = sender;
     });
+
+    pc.onconnectionstatechange = async () => {
+      if (pc.connectionState === 'connected' && videoSender) {
+        try {
+          const params = videoSender.getParameters();
+          if (!params.encodings || params.encodings.length === 0) {
+            params.encodings = [{}];
+          }
+          params.encodings[0].maxBitrate = preset.bitrate;
+          params.encodings[0].maxFramerate = preset.fps;
+          await videoSender.setParameters(params);
+        } catch {
+          // Navegador gerencia o bitrate automaticamente
+        }
+      }
+    };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -297,7 +344,7 @@ function RoomContent() {
       payload: {
         from: peerIdRef.current,
         to: viewerId,
-        sdp: offer,
+        sdp: { type: offer.type, sdp: offer.sdp },
       },
     });
   }
@@ -310,14 +357,34 @@ function RoomContent() {
     const channel = channelRef.current;
     if (!channel) return;
 
+    setConnectionStatus('connecting');
     closePeerConnection(sharerId);
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+
+    const pc = new RTCPeerConnection(getIceConfig());
     peerConnectionsRef.current.set(sharerId, pc);
 
+    const fallbackStream = new MediaStream();
+
     pc.ontrack = (event) => {
-      const [remoteStream] = event.streams;
-      if (remoteStream) {
-        attachStreamToVideo(remoteStream, false);
+      if (event.streams && event.streams[0]) {
+        attachStreamToVideo(event.streams[0], false);
+      } else {
+        fallbackStream.addTrack(event.track);
+        attachStreamToVideo(fallbackStream, false);
+      }
+      setConnectionStatus('connected');
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connecting') {
+        setConnectionStatus('connecting');
+      } else if (pc.connectionState === 'connected') {
+        setConnectionStatus('connected');
+      } else if (
+        pc.connectionState === 'failed' ||
+        pc.connectionState === 'disconnected'
+      ) {
+        setConnectionStatus('failed');
       }
     };
 
@@ -347,8 +414,23 @@ function RoomContent() {
       payload: {
         from: peerIdRef.current,
         to: sharerId,
-        sdp: answer,
+        sdp: { type: answer.type, sdp: answer.sdp },
       },
+    });
+  }
+
+  function requestStreamFromSharer(sharerId: string, force = false) {
+    const channel = channelRef.current;
+    if (!channel || sharerId === peerIdRef.current) return;
+    if (!force && requestedSharerRef.current === sharerId) return;
+
+    requestedSharerRef.current = sharerId;
+    setConnectionStatus('negotiating');
+
+    channel.send({
+      type: 'broadcast',
+      event: 'request-stream',
+      payload: { from: peerIdRef.current, to: sharerId, force },
     });
   }
 
@@ -381,41 +463,33 @@ function RoomContent() {
         const sharer = list.find((p) => p.isSharing) || null;
         setActiveSharer(sharer);
 
-        // Se já tem alguém transmitindo quando entrei, solicita o stream automaticamente
-        if (
-          sharer &&
-          sharer.peerId !== myId &&
-          requestedSharerRef.current !== sharer.peerId
-        ) {
-          requestedSharerRef.current = sharer.peerId;
-          channel.send({
-            type: 'broadcast',
-            event: 'request-stream',
-            payload: { from: myId, to: sharer.peerId },
-          });
+        if (sharer && sharer.peerId !== myId) {
+          requestStreamFromSharer(sharer.peerId, false);
         }
 
         if (!sharer && !localStreamRef.current) {
           requestedSharerRef.current = null;
+          setConnectionStatus('idle');
           attachStreamToVideo(null, false);
         }
       })
       .on('presence', { event: 'leave' }, ({ key }) => {
-        if (key) closePeerConnection(key);
+        if (key) {
+          closePeerConnection(key);
+          if (requestedSharerRef.current === key) {
+            requestedSharerRef.current = null;
+            setConnectionStatus('idle');
+          }
+        }
       })
       .on('broadcast', { event: 'request-stream' }, ({ payload }) => {
         if (payload.to === myId && localStreamRef.current) {
-          createOfferForViewer(payload.from);
+          createOfferForViewer(payload.from, Boolean(payload.force));
         }
       })
       .on('broadcast', { event: 'sharer-started' }, ({ payload }) => {
         if (payload.sharerId !== myId) {
-          requestedSharerRef.current = payload.sharerId;
-          channel.send({
-            type: 'broadcast',
-            event: 'request-stream',
-            payload: { from: myId, to: payload.sharerId },
-          });
+          requestStreamFromSharer(payload.sharerId, false);
         }
       })
       .on('broadcast', { event: 'sharer-stopped' }, ({ payload }) => {
@@ -424,6 +498,7 @@ function RoomContent() {
           requestedSharerRef.current = null;
         }
         if (!localStreamRef.current) {
+          setConnectionStatus('idle');
           attachStreamToVideo(null, false);
         }
       })
@@ -435,9 +510,13 @@ function RoomContent() {
       .on('broadcast', { event: 'webrtc-answer' }, async ({ payload }) => {
         if (payload.to === myId) {
           const pc = peerConnectionsRef.current.get(payload.from);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-            await flushPendingCandidates(payload.from, pc);
+          if (pc && pc.signalingState === 'have-local-offer') {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+              await flushPendingCandidates(payload.from, pc);
+            } catch {
+              // Ignora resposta duplicada
+            }
           }
         }
       })
@@ -516,7 +595,6 @@ function RoomContent() {
       setShowQualityMenu(false);
       attachStreamToVideo(stream, true);
 
-      // Se o usuário clicar no botão nativo "Parar compartilhamento" do navegador
       stream.getVideoTracks()[0].onended = () => {
         stopScreenShare();
       };
@@ -549,6 +627,7 @@ function RoomContent() {
 
     closeAllPeerConnections();
     setIsSharing(false);
+    setConnectionStatus('idle');
     attachStreamToVideo(null, false);
 
     const channel = channelRef.current;
@@ -788,7 +867,7 @@ function RoomContent() {
         {/* Palco do Vídeo */}
         <section
           ref={stageRef}
-          className="liquid-glass liquid-specular relative flex flex-1 flex-col overflow-hidden rounded-[32px]"
+          className="liquid-glass liquid-specular relative flex flex-1 flex-col overflow-hidden rounded-4xl"
         >
           {/* Selo AO VIVO flutuante */}
           <AnimatePresence>
@@ -839,9 +918,9 @@ function RoomContent() {
               }`}
             />
 
-            {/* Estado vazio (ninguém transmitindo ainda) */}
+            {/* Estado vazio ou aguardando conexão P2P */}
             {!hasVideoStream && (
-              <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center p-6 text-center">
+              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center">
                 <motion.div
                   animate={{ y: [0, -6, 0] }}
                   transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
@@ -849,13 +928,38 @@ function RoomContent() {
                 >
                   <Sparkles className="h-8 w-8 opacity-75" />
                 </motion.div>
-                <h3 className="text-xl font-extrabold sm:text-2xl">
-                  Ninguém telando agora
-                </h3>
-                <p className="mt-1.5 max-w-sm text-sm opacity-70">
-                  Clique em <strong>Transmitir Tela</strong> no dock abaixo para
-                  compartilhar seu monitor, janela ou jogo em até 1080p 60fps.
-                </p>
+
+                {activeSharer && activeSharer.peerId !== peerIdRef.current ? (
+                  <>
+                    <h3 className="text-xl font-extrabold sm:text-2xl">
+                      {connectionStatus === 'failed'
+                        ? 'Falha na conexão de vídeo'
+                        : `Conectando à tela de ${activeSharer.username}...`}
+                    </h3>
+                    <p className="mt-1.5 max-w-sm text-sm opacity-70">
+                      {connectionStatus === 'failed'
+                        ? 'A rede bloqueou a conexão direta (NAT/CGNAT). Tente reconectar ou configure o servidor TURN.'
+                        : 'Estabelecendo transmissão P2P em alta qualidade.'}
+                    </p>
+                    <button
+                      onClick={() => requestStreamFromSharer(activeSharer.peerId, true)}
+                      className="liquid-btn-accent mt-5 flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-bold"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Reconectar Vídeo
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <h3 className="text-xl font-extrabold sm:text-2xl">
+                      Ninguém telando agora
+                    </h3>
+                    <p className="mt-1.5 max-w-sm text-sm opacity-70">
+                      Clique em <strong>Transmitir Tela</strong> no dock abaixo para
+                      compartilhar seu monitor, janela ou jogo em até 1080p 60fps.
+                    </p>
+                  </>
+                )}
               </div>
             )}
 
@@ -881,7 +985,6 @@ function RoomContent() {
           {/* Dock Flutuante Liquid Glass (Controles da Transmissão) */}
           <div className="pointer-events-none absolute bottom-4 left-0 right-0 z-20 flex justify-center px-3">
             <div className="liquid-glass-strong liquid-specular pointer-events-auto relative flex flex-wrap items-center justify-center gap-2 rounded-full px-3 py-2">
-              {/* Seletor de qualidade antes de transmitir */}
               {!isSharing && (
                 <div className="relative">
                   <button
@@ -901,32 +1004,29 @@ function RoomContent() {
                         exit={{ opacity: 0, y: 8, scale: 0.94 }}
                         className="liquid-glass-strong absolute bottom-14 left-0 w-48 rounded-3xl p-2"
                       >
-                        {(Object.keys(QUALITY_CONFIG) as QualityPreset[]).map(
-                          (q) => (
-                            <button
-                              key={q}
-                              onClick={() => {
-                                setQuality(q);
-                                setShowQualityMenu(false);
-                              }}
-                              className={`flex w-full items-center justify-between rounded-2xl px-3 py-2 text-left text-xs font-bold transition-colors ${
-                                quality === q
-                                  ? 'bg-sky-500/20 text-sky-400'
-                                  : 'hover:bg-white/10'
-                              }`}
-                            >
-                              <span>{QUALITY_CONFIG[q].label}</span>
-                              {quality === q && <Check className="h-3.5 w-3.5" />}
-                            </button>
-                          )
-                        )}
+                        {(Object.keys(QUALITY_CONFIG) as QualityPreset[]).map((q) => (
+                          <button
+                            key={q}
+                            onClick={() => {
+                              setQuality(q);
+                              setShowQualityMenu(false);
+                            }}
+                            className={`flex w-full items-center justify-between rounded-2xl px-3 py-2 text-left text-xs font-bold transition-colors ${
+                              quality === q
+                                ? 'bg-sky-500/20 text-sky-400'
+                                : 'hover:bg-white/10'
+                            }`}
+                          >
+                            <span>{QUALITY_CONFIG[q].label}</span>
+                            {quality === q && <Check className="h-3.5 w-3.5" />}
+                          </button>
+                        ))}
                       </motion.div>
                     )}
                   </AnimatePresence>
                 </div>
               )}
 
-              {/* Botão Principal Transmitir / Parar */}
               {!isSharing ? (
                 <button
                   onClick={startScreenShare}
@@ -949,7 +1049,6 @@ function RoomContent() {
                 </button>
               )}
 
-              {/* Controle de Volume (para espectadores) */}
               {!isSharing && hasVideoStream && (
                 <div className="liquid-pill flex items-center gap-2 rounded-full px-3 py-1.5">
                   <button
@@ -977,7 +1076,6 @@ function RoomContent() {
                 </div>
               )}
 
-              {/* Reações Rápidas */}
               <div className="hidden items-center gap-1 sm:flex">
                 {QUICK_EMOJIS.map((emoji) => (
                   <button
@@ -990,7 +1088,6 @@ function RoomContent() {
                 ))}
               </div>
 
-              {/* Tela Cheia */}
               <button
                 onClick={handleFullscreen}
                 className="liquid-pill flex h-9 w-9 items-center justify-center rounded-full"
@@ -1010,9 +1107,8 @@ function RoomContent() {
               animate={{ width: 340, opacity: 1, x: 0 }}
               exit={{ width: 0, opacity: 0, x: 20 }}
               transition={{ type: 'spring', stiffness: 320, damping: 30 }}
-              className="liquid-glass liquid-specular hidden h-full shrink-0 flex-col overflow-hidden rounded-[32px] lg:flex"
+              className="liquid-glass liquid-specular hidden h-full shrink-0 flex-col overflow-hidden rounded-4xl lg:flex"
             >
-              {/* Seletor de Abas estilo iOS Segmented Control */}
               <div className="p-3">
                 <div className="liquid-input relative grid grid-cols-2 rounded-full p-1">
                   {(['chat', 'users'] as const).map((tab) => {
@@ -1098,7 +1194,6 @@ function RoomContent() {
                     <div ref={chatEndRef} />
                   </div>
 
-                  {/* Input do Chat */}
                   <form
                     onSubmit={handleSendMessage}
                     className="flex items-center gap-2 p-3"
