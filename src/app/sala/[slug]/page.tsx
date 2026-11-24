@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -79,7 +79,7 @@ const USER_COLORS = [
 
 const QUICK_EMOJIS = ['🔥', '😂', '👏', '🤯', '💀'];
 
-export default function RoomPage() {
+function RoomContent() {
   const params = useParams();
   const router = useRouter();
   const slug = String(params.slug || '');
@@ -1159,5 +1159,22 @@ export default function RoomPage() {
         </AnimatePresence>
       </div>
     </main>
+  );
+}
+
+export default function RoomPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="relative flex min-h-screen items-center justify-center p-6">
+          <LiquidBackground />
+          <div className="liquid-glass-strong rounded-full px-6 py-3 text-sm font-bold">
+            Carregando sala...
+          </div>
+        </main>
+      }
+    >
+      <RoomContent />
+    </Suspense>
   );
 }
